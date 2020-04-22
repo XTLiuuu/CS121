@@ -20,6 +20,7 @@
         ((quoted? exp) (text-of-quotation exp))
         ((assignment? exp) (eval-assignment exp env))
         ((definition? exp) (eval-definition exp env))
+        ((cons? exp) (internal-cons exp env))
         ((if? exp) (eval-if exp env))
         ((lambda? exp)
          (make-procedure (lambda-parameters exp)
@@ -29,25 +30,62 @@
          (eval-sequence (begin-actions exp) env))
         ((cond? exp) (mc-eval (cond->if exp) env))
         ((application? exp)
-         (mc-apply (mc-eval (operator exp) env)
-                   (list-of-values (operands exp) env)))
+         (mc-apply (actual-value (operator exp) env) ; changed 
+                (operands exp)
+                env))
         (else
          (error "Unknown expression type -- EVAL" exp))))
 
-(define (mc-apply procedure arguments)
+; our new version of apply is also almost the same
+; the difference is that eval has passed in unevaluated operand expressions
+; for primitive expressions (which are strict), we evaluate all the arguments before applying the primitive
+; for compound procedures (which are non-strict), we delay all the arguments before applying the procedure
+(define (mc-apply procedure arguments env)
   (cond ((primitive-procedure? procedure)
-         (apply-primitive-procedure procedure arguments))
+         (apply-primitive-procedure
+          procedure
+          (list-of-arg-values arguments env))) ; changed 
         ((compound-procedure? procedure)
          (eval-sequence
            (procedure-body procedure)
            (extend-environment
              (procedure-parameters procedure)
-             arguments
+             (list-of-delayed-args arguments env) ; changed 
              (procedure-environment procedure))))
         (else
          (error
           "Unknown procedure type -- APPLY" procedure))))
 
+; whenever we need the actual value of an expression, we use
+; instead of just eval, so that if the expression's value is a thunk, it will be forced 
+(define (actual-value exp env)
+  (force-it (mc-eval exp env)))
+
+(define (force-it obj)
+  (if (thunk? obj)
+      (actual-value (thunk-exp obj) (thunk-env obj))
+      obj))
+
+; create a thunk
+(define (delay-it exp env)
+  (list 'thunk exp env))
+
+; use actual value instead of eval - together with apply
+(define (list-of-arg-values exps env)
+  (if (no-operands? exps)
+      '()
+      (cons (actual-value (first-operand exps)
+                          env)
+            (list-of-arg-values (rest-operands exps)
+                                env))))
+
+; delays the arguments instead of evaluating them - together with apply
+(define (list-of-delayed-args exps env)
+  (if (no-operands? exps)
+      '()
+      (cons (delay-it (first-operand exps)
+                      env)
+            (list-of-delayed-args (rest-operands exps) env))))
 
 (define (list-of-values exps env)
   (if (no-operands? exps)
@@ -55,10 +93,12 @@
       (cons (mc-eval (first-operand exps) env)
             (list-of-values (rest-operands exps) env))))
 
+; handle if
 (define (eval-if exp env)
-  (if (true? (mc-eval (if-predicate exp) env))
+  (if (true? (actual-value (if-predicate exp) env))
       (mc-eval (if-consequent exp) env)
       (mc-eval (if-alternative exp) env)))
+
 
 (define (eval-sequence exps env)
   (cond ((last-exp? exps) (mc-eval (first-exp exps) env))
@@ -82,6 +122,7 @@
 (define (self-evaluating? exp)
   (cond ((number? exp) true)
         ((string? exp) true)
+        ((boolean? exp) true)
         (else false)))
 
 (define (quoted? exp)
@@ -107,16 +148,26 @@
 (define (definition? exp)
   (tagged-list? exp 'define))
 
+(define (cons? exp)
+  (tagged-list? exp 'cons))
+
+; how about cons actual1st delay2nd and then else
+(define (internal-cons exp env)
+  ;(display "in internal cons")
+  (let ((internal-car (cadr exp))
+        (internal-cdr (caddr exp)))
+  (cons (actual-value internal-car env) (delay-it internal-cdr env))))
+
 (define (definition-variable exp)
   (if (symbol? (cadr exp))
-      (cadr exp)
-      (caadr exp)))
+      (cadr exp) ; just a variable 
+      (caadr exp))) ; get the procedure name
 
 (define (definition-value exp)
   (if (symbol? (cadr exp))
-      (caddr exp)
-      (make-lambda (cdadr exp)
-                   (cddr exp))))
+      (caddr exp) ;; value for the variable 
+      (make-lambda (cdadr exp) ; a procedure (body) - parameter (a (delayed b) - get rid of the procedure name already
+                   (cddr exp)))) ; operation
 
 (define (lambda? exp) (tagged-list? exp 'lambda))
 
@@ -157,6 +208,8 @@
 
 (define (make-begin seq) (cons 'begin seq))
 
+(define (make-cons seq) (cons 'cons seq))
+
 
 (define (application? exp) (pair? exp))
 (define (operator exp) (car exp))
@@ -194,6 +247,18 @@
             (make-if (cond-predicate first)
                      (sequence->exp (cond-actions first))
                      (expand-clauses rest))))))
+
+(define (thunk? obj)
+  (tagged-list? obj 'thunk))
+
+(define (thunk-exp thunk) (cadr thunk))
+(define (thunk-env thunk) (caddr thunk))
+
+(define (evaluated-thunk? obj)
+  (tagged-list? obj 'evaluated-thunk))
+
+(define (thunk-value evaluated-thunk)
+  (cadr evaluated-thunk))
 
 ;;;SECTION 4.1.3
 
@@ -241,10 +306,12 @@
 
 (define (lookup-variable-value var env)
   (define (env-loop env)
-    (define (scan vars vals)
-      (cond ((null? vars)
+    (define (scan vars vals) ; var maybe a list
+      (cond ((null? vars) ; end of current environment 
              (env-loop (enclosing-environment env)))
             ((eq? var (car vars))
+             (car vals))
+            ((and (pair? (car vars)) (eq? var (car (cdr (car vars))))) ; variable begins with delayed, such as (delayed b) 
              (car vals))
             (else (scan (cdr vars) (cdr vals)))))
     (if (eq? env the-empty-environment)
@@ -333,13 +400,16 @@
   (apply-in-underlying-scheme
    (primitive-implementation proc) args))
 
-(define input-prompt ";;; M-Eval input:")
-(define output-prompt ";;; M-Eval value:")
+; driver 
+(define input-prompt ";;; L-Eval input:")
+(define output-prompt ";;; L-Eval value:")
 
 (define (driver-loop)
   (prompt-for-input input-prompt)
   (let ((input (read)))
-    (let ((output (mc-eval input the-global-environment)))
+    (let ((output
+           (actual-value
+            input the-global-environment)))
       (announce-output output-prompt)
       (user-print output)))
   (driver-loop))
@@ -357,9 +427,6 @@
                      (procedure-body object)
                      '<procedure-env>))
       (display object)))
-
-(define true #t)
-(define false #f)
 
 (define the-global-environment (setup-environment))
 
